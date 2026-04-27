@@ -6,7 +6,7 @@ import pool from './config/database';
 import redis from './config/redis';
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
-
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const startServer = async (): Promise<void> => {
   try {
     // Verify DB connection
@@ -17,8 +17,8 @@ const startServer = async (): Promise<void> => {
     await redis.connect();
 
     app.listen(PORT, () => {
-      console.log(`Server running on http://localhost:${PORT}`);
-      console.log(`API Docs: http://localhost:${PORT}/api-docs`);
+      console.log(`Server running on ${PORT}`);
+      console.log(`API Docs: ${BASE_URL}/api-docs`);
     });
   } catch (err) {
     console.error('Failed to start server:', (err as Error).message);
