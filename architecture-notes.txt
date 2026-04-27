@@ -1,0 +1,194 @@
+CONTENT BROADCASTING API — ARCHITECTURE NOTES
+
+
+1. AUTHENTICATION & RBAC FLOW
+
+- JWT  issued on login with payload: { id, email, role }
+- Token expiry: 24h (configurable via JWT_EXPIRES_IN)
+- Every protected route uses the `authenticate` middleware which:
+    1. Reads Authorization: Bearer <token>
+    2. Verifies JWT signature and expiry
+    3. Fetches fresh user from DB (prevents stale role data after role changes)
+    4. Attaches user to req.user
+
+- RBAC enforced by the `authorize(...roles)` middleware:
+    - `authorize('teacher')` → 403 for anyone not a teacher
+    - `authorize('principal')` → 403 for anyone not a principal
+    - Principals and teachers have strictly separated route access
+
+- Password storage: bcryptjs with salt rounds = 12
+
+2. SUBJECT-BASED SYSTEM DESIGN
+
+- Each (teacher, subject) pair maps to a unique content_slot row
+- Subjects are stored lowercase for case-insensitive matching
+- content_schedule tracks the rotation_order and duration per slot
+- When a teacher uploads and content is approved, a slot is auto-created
+- API supports subject filtering on the public endpoint:
+    GET /content/live/:teacherId?subject=maths
+
+3. UPLOAD HANDLING APPROACH
+
+ - Cloudinary handles multipart uploads via Multer (memory storage):
+ - Files are received using multer with memory storage (no local disk usage)
+ - Uploaded buffers are directly streamed to Cloudinary
+ - File validation:
+   File type filter: only jpg, jpeg, png, gif allowed
+    (validated using MIME type + extension)
+ - File size limit: 10MB
+   (configurable via MAX_FILE_SIZE_MB env variable)
+ - Upload strategy:
+    Files are uploaded using Cloudinary SDK (upload_stream or uploader.upload)
+    Each file is stored in a structured folder (e.g. content-broadcast/)
+
+Public ID naming strategy:
+
+{folder}/{timestamp}-{random}
+
+→ prevents collisions and ensures uniqueness
+
+
+4. APPROVAL WORKFLOW DESIGN
+
+Content lifecycle:
+    [uploaded] -> pending -> approved | rejected
+
+- On upload: status = 'pending' automatically
+- Only principals can call PATCH /content/:id/approve or /reject
+- Approval:
+    - Sets status = 'approved', records approved_by and approved_at
+    - Auto-inserts into content_schedule for rotation
+- Rejection:
+    - Sets status = 'rejected', stores rejection_reason
+    - Removes from content_schedule if present
+- Rejected content is visible to teachers with the reason shown
+- Content in any non-pending state cannot be approved/rejected again
+
+5. SCHEDULING / ROTATION LOGIC (VERY IMPORTANT)
+
+This is the core business logic. No cron jobs, no state. It is purely
+deterministic and computed on every request.
+
+HOW IT WORKS:
+  Given a list of approved, active content items for a subject, each
+  with a rotation_duration in minutes:
+
+  Step 1: Sum all durations → totalCycleDuration
+  Step 2: currentMinutes = floor(Date.now() / 1000 / 60)
+  Step 3: positionInCycle = currentMinutes % totalCycleDuration
+  Step 4: Walk the list, accumulating durations; return item when
+          accumulated > positionInCycle
+
+EXAMPLE:
+  Content A: 5 min, Content B: 3 min, Content C: 7 min
+  totalCycleDuration = 15 min
+  If currentMinutes = 1000, positionInCycle = 1000 % 15 = 10
+  Walk: A accumulates to 5 (< 10), B to 8 (< 10), C to 15 (>= 10) → C is active
+
+PROPERTIES:
+  - Stateless: no DB writes on each broadcast request
+  - Deterministic: any two servers compute the same result for the same time
+  - Looping: modulo ensures continuous rotation
+  - Subject-isolated: each subject runs its own independent cycle
+  - Ordering: rotation_order in content_schedule controls the sequence
+
+CONTENT IS ONLY ELIGIBLE IF:
+  - status = 'approved'
+  - start_time IS NOT NULL AND end_time IS NOT NULL
+  - NOW() BETWEEN start_time AND end_time
+
+6. DATABASE DESIGN DECISIONS
+
+Tables:
+  users             - stores all users (principal & teacher) with bcrypt hash
+  content           - main content table with full lifecycle state
+  content_slots     - one row per (teacher, subject) — the "broadcast channel"
+  content_schedule  - rotation entries: links content to slot with order & duration
+
+Key design choices:
+  - UUIDs as PKs (gen_random_uuid()) — avoids enumerable IDs in public endpoints
+  - content_slots has UNIQUE(teacher_id, subject) — enforced at DB level
+  - content_schedule has UNIQUE(slot_id, rotation_order) — prevents duplicate ordering
+  - Indexes on: content.status, content.uploaded_by, content.subject,
+    content_schedule.slot_id, content_slots.teacher_id
+  - CASCADE deletes: removing a user cascades to content; removing content
+    cascades to schedule entries
+  - approved_by references users with SET NULL — so deleting a principal
+    doesn't orphan content records
+
+7. FOLDER STRUCTURE
+
+src/
+  config/
+    database.js       — PostgreSQL pool
+    migrate.js        — Schema creation
+    swagger.js        — OpenAPI spec config
+  controllers/
+    auth.controller.js     — Login, register, me
+    content.controller.js  — Upload, approve, reject, live, list
+  middlewares/
+    auth.middleware.js          — authenticate (JWT), authorize (RBAC)
+    upload.middleware.js        — Multer config + error handler
+    validate.middleware.js      — express-validator runner
+    error.middleware.js         — Global error + 404 handler
+    rateLimiter.middleware.js   — Public API + auth rate limiting
+  models/
+    user.model.js             — User DB queries
+    content.model.js          — Content DB queries
+    contentSlot.model.js      — Slot get/create
+    contentSchedule.model.js  — Schedule upsert/fetch
+  routes/
+    auth.routes.js     — /auth/*
+    content.routes.js  — /content/*
+  services/
+    auth.service.js        — Register, login, token generation
+    content.service.js     — Upload, approve, reject, list
+    scheduling.service.js  — Rotation algorithm (getLiveContent)
+  utils/
+    response.utils.js  — Helper response formatters
+  uploads/             — Local file storage (gitignored)
+  app.js               — Express app setup
+  server.js            — Entry point
+
+8. MIDDLEWARE USAGE
+
+Request pipeline for protected routes:
+  authenticate → authorize(role) -> [validation] -> validate -> controller
+
+Request pipeline for file upload:
+  authenticate -> authorize('teacher') -> upload.single('file')
+  -> handleUploadError -> validate -> controller
+
+Public routes:
+  publicApiLimiter -> [validation] -> validate -> controller
+
+9. SCALABILITY APPROACH
+
+Current:
+  - Stateless scheduling (no DB writes per request) scales horizontally
+  - Indexed DB queries for fast lookups
+  - Connection pooling via pg.Pool (max 20 connections)
+  - Redis caching: Cache getLiveContent() result per teacherId for 30s–1min
+    to reduce DB load under high student traffic.
+    Key: live:teacher:{teacherId}, TTL: 60s
+    Invalidate on: approval/rejection or content update
+  
+  - Rate limiting: Already implemented by Redis for distributed rate limiting.
+
+Bonus / Future improvements:
+  
+
+  - S3 Upload: Replace Cloudinary.
+    Return CDN-backed URLs for files. Enables horizontal scaling
+    without shared filesystem.
+
+  - Queue-based approval notifications: Use BullMQ or similar to notify
+    teachers when their content is approved/rejected.
+
+  - Pagination: Already implemented on GET /content/all and /my.
+
+  - Horizontal scaling: Because scheduling is deterministic and stateless,
+    multiple instances of this server will always compute the same
+    "currently active content" for any given moment — no coordination needed.
+
+
